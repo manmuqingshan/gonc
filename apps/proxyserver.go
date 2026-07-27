@@ -289,6 +289,10 @@ func handleHTTPConnect(clientConn net.Conn, req *http.Request, config *AppS5SCon
 	defer config.Logger.Printf("HTTP: %s client disconnected.", clientConn.RemoteAddr().String())
 
 	if config.UpstreamClient != nil {
+		if config.AccessCtrl != nil && config.AccessCtrl.ShouldDenyOutboundAddress(req.Host) {
+			clientConn.Write([]byte("HTTP/1.1 403 Forbidden\r\n\r\n"))
+			return fmt.Errorf("access denied by ACL for %s", req.Host)
+		}
 		targetConn, err := config.UpstreamClient.DialTimeout("tcp", req.Host, 25*time.Second)
 		if err != nil {
 			clientConn.Write([]byte("HTTP/1.1 502 Bad Gateway\r\n\r\n"))

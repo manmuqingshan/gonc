@@ -110,17 +110,35 @@ gonc -tls -sni www.google.com <target_ip> 443
 `-acl <file>`
 
 **ACL 文件格式**：
-ACL 文件是一个简单的文本文件，支持 `allow` (允许) 和 `deny` (拒绝) 规则。规则按顺序匹配。
+ACL 文件是一个简单的文本文件，支持入站和出站的允许、拒绝规则。`allow_inbound` 或
+`allow_outbound` 配置段一旦出现，就会为对应方向启用默认拒绝模式；显式 `deny` 规则优先。
+
+- `allow_inbound`：按来源 IPv4、IPv6 或 CIDR 放行。
+- `allow_outbound`：按精确目标 host 和端口放行，支持 `host:port` 和 `host:start-end`。
+- `deny_inbound`：按来源 IP/CIDR 拒绝，可用 `!` 添加更具体的例外。
+- `deny_outbound`：按目标 IP/CIDR/域名拒绝，可用 `!` 添加例外。
+- IPv6 出站允许规则必须写成 `[IPv6]:port`。
+- 允许配置段为空时，表示拒绝该方向的全部连接。
 
 **`acl.txt` 示例**：
 
 ```text
+# 只允许这些来源 IP
+[allow_inbound]
+203.0.113.0/24
+2001:db8:100::/48
 
-# 入站拒绝规则
+# 即使位于允许网段内，也拒绝这个来源
 [deny_inbound]
+203.0.113.66
 
+# 只允许这些目标 host+port
+[allow_outbound]
+api.example.com:443
+192.168.1.30:8000-8999
+[2001:db8::20]:10000-10100
 
-# 出站拒绝规则 (包含域名和IP)
+# 额外禁止访问回环和内网地址；域名解析出的 IP 也会检查
 [deny_outbound]
 127.0.0.0/8
 10.0.0.0/8

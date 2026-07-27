@@ -2632,7 +2632,7 @@ func preinitBuiltinAppConfig(ncconfig *AppNetcatConfig, commandline string) erro
 		if err == nil {
 			ncconfig.app_s5s_Config.AccessCtrl = ncconfig.accessControl
 			if ncconfig.app_s5s_Config.UpstreamClient != nil && ncconfig.accessControl != nil {
-				ncconfig.Logger.Printf(":s5s -x enabled: outbound ACL for target addresses is ignored; inbound ACL still applies.\n")
+				ncconfig.Logger.Printf(":s5s -x enabled: outbound ACL checks the requested host and port; resolved-IP rules cannot be verified because DNS is handled by the upstream proxy.\n")
 			}
 		}
 	case ":s5c":

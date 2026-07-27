@@ -1,14 +1,17 @@
 package acl
 
-// VERSION 1.1.0 (Reliability Update + Exception Support)
+// VERSION 1.2.0 (Inbound/Outbound Allowlist Support)
 import (
 	"bufio"
 	"context"
 	"fmt"
 	"net"
+	"net/netip"
 	"os"
+	"sort"
 	"strconv"
 	"strings"
+	"unicode"
 )
 
 // 定义动作常量
@@ -223,38 +226,218 @@ func (dm *domainMatcher) Match(domain string) bool {
 	return false
 }
 
+type portRange struct {
+	start uint16
+	end   uint16
+}
+
+// endpointAllowlist stores exact IP/domain hosts and their allowed port ranges.
+// Host wildcards and CIDRs are intentionally unsupported here: allowlist entries
+// must identify one concrete host.
+type endpointAllowlist struct {
+	ranges map[string][]portRange
+}
+
+func newEndpointAllowlist() *endpointAllowlist {
+	return &endpointAllowlist{ranges: make(map[string][]portRange)}
+}
+
+func normalizeEndpointHost(host string) (key string, normalized string, err error) {
+	host = strings.TrimSpace(host)
+	if host == "" {
+		return "", "", fmt.Errorf("host is empty")
+	}
+
+	if ip, parseErr := netip.ParseAddr(host); parseErr == nil {
+		ip = ip.Unmap()
+		normalized = ip.String()
+		return "ip:" + normalized, normalized, nil
+	}
+
+	if strings.ContainsAny(host, "*/") {
+		return "", "", fmt.Errorf("host must be an exact IP or domain")
+	}
+	host = strings.TrimSuffix(host, ".")
+	if host == "" {
+		return "", "", fmt.Errorf("domain is empty")
+	}
+	if strings.ContainsAny(host, " \t\r\n[]:") {
+		return "", "", fmt.Errorf("invalid domain %q", host)
+	}
+	if len(host) > 253 {
+		return "", "", fmt.Errorf("domain is longer than 253 bytes")
+	}
+	for _, label := range strings.Split(host, ".") {
+		if label == "" || len(label) > 63 {
+			return "", "", fmt.Errorf("invalid domain label in %q", host)
+		}
+		for index, r := range label {
+			if unicode.IsLetter(r) || unicode.IsDigit(r) || r == '_' {
+				continue
+			}
+			if r == '-' && index > 0 && index < len(label)-1 {
+				continue
+			}
+			return "", "", fmt.Errorf("invalid character %q in domain %q", r, host)
+		}
+	}
+	normalized = strings.ToLower(host)
+	return "domain:" + normalized, normalized, nil
+}
+
+func parsePortRange(spec string) (portRange, error) {
+	spec = strings.TrimSpace(spec)
+	parts := strings.Split(spec, "-")
+	if len(parts) < 1 || len(parts) > 2 {
+		return portRange{}, fmt.Errorf("invalid port or port range %q", spec)
+	}
+
+	parsePort := func(value string) (uint16, error) {
+		value = strings.TrimSpace(value)
+		if value == "" {
+			return 0, fmt.Errorf("port is empty")
+		}
+		for _, r := range value {
+			if r < '0' || r > '9' {
+				return 0, fmt.Errorf("port %q must be numeric", value)
+			}
+		}
+		port, err := strconv.Atoi(value)
+		if err != nil || port < 1 || port > 65535 {
+			return 0, fmt.Errorf("port %q must be between 1 and 65535", value)
+		}
+		return uint16(port), nil
+	}
+
+	start, err := parsePort(parts[0])
+	if err != nil {
+		return portRange{}, err
+	}
+	end := start
+	if len(parts) == 2 {
+		end, err = parsePort(parts[1])
+		if err != nil {
+			return portRange{}, err
+		}
+		if start > end {
+			return portRange{}, fmt.Errorf("port range start %d is greater than end %d", start, end)
+		}
+	}
+	return portRange{start: start, end: end}, nil
+}
+
+func parseOutboundAllowRule(rule string) (string, portRange, error) {
+	host, portSpec, err := net.SplitHostPort(strings.TrimSpace(rule))
+	if err != nil {
+		return "", portRange{}, fmt.Errorf("expected host:port or host:start-end: %w", err)
+	}
+	key, _, err := normalizeEndpointHost(host)
+	if err != nil {
+		return "", portRange{}, err
+	}
+	ports, err := parsePortRange(portSpec)
+	if err != nil {
+		return "", portRange{}, err
+	}
+	return key, ports, nil
+}
+
+func (l *endpointAllowlist) add(key string, ports portRange) {
+	l.ranges[key] = append(l.ranges[key], ports)
+}
+
+func (l *endpointAllowlist) finalize() {
+	for key, ranges := range l.ranges {
+		sort.Slice(ranges, func(i, j int) bool {
+			if ranges[i].start == ranges[j].start {
+				return ranges[i].end < ranges[j].end
+			}
+			return ranges[i].start < ranges[j].start
+		})
+
+		merged := ranges[:0]
+		for _, current := range ranges {
+			if len(merged) == 0 {
+				merged = append(merged, current)
+				continue
+			}
+			last := &merged[len(merged)-1]
+			if uint32(current.start) <= uint32(last.end)+1 {
+				if current.end > last.end {
+					last.end = current.end
+				}
+				continue
+			}
+			merged = append(merged, current)
+		}
+		l.ranges[key] = merged
+	}
+}
+
+func (l *endpointAllowlist) match(host string, port int) bool {
+	if port < 1 || port > 65535 {
+		return false
+	}
+	key, _, err := normalizeEndpointHost(host)
+	if err != nil {
+		return false
+	}
+	ranges := l.ranges[key]
+	target := uint16(port)
+	index := sort.Search(len(ranges), func(i int) bool {
+		return ranges[i].end >= target
+	})
+	return index < len(ranges) && ranges[index].start <= target
+}
+
 // ============================================================================
 //  ACL (访问控制列表) - 顶层结构
 // ============================================================================
 
 // ACL 持有已编译的访问控制列表规则。
 type ACL struct {
-	inboundIPv4  *radixTree
-	inboundIPv6  *radixTree
-	outboundIPv4 *radixTree
-	outboundIPv6 *radixTree
-	outbound     *domainMatcher
+	inboundIPv4          *radixTree
+	inboundIPv6          *radixTree
+	inboundAllowIPv4     *radixTree
+	inboundAllowIPv6     *radixTree
+	inboundAllowEnabled  bool
+	outboundIPv4         *radixTree
+	outboundIPv6         *radixTree
+	outbound             *domainMatcher
+	outboundAllow        *endpointAllowlist
+	outboundAllowEnabled bool
 }
 
 // ShouldDeny 检查对于给定的地址和方向，请求是否应该被拒绝。
+// 出站 allow_outbound 规则包含端口，必须通过 ShouldDenyOutbound 检查。
 func (a *ACL) ShouldDeny(address string, direction string) bool {
+	if a == nil {
+		return false
+	}
 	direction = strings.ToLower(direction)
 	if direction == "inbound" {
 		ip := net.ParseIP(address)
 		if ip == nil {
-			return false // 无效的 IP 地址无法匹配，因此不拒绝
+			// 白名单模式必须 fail closed；旧的 deny-only 模式保持兼容。
+			return a.inboundAllowEnabled
 		}
 
-		var action int
+		var denyAction int
+		var allowAction int
 		// 检查是否为 IPv4 地址
 		if ipv4 := ip.To4(); ipv4 != nil {
-			action = a.inboundIPv4.Match(ipv4)
+			denyAction = a.inboundIPv4.Match(ipv4)
+			allowAction = a.inboundAllowIPv4.Match(ipv4)
 		} else {
-			action = a.inboundIPv6.Match(ip)
+			denyAction = a.inboundIPv6.Match(ip)
+			allowAction = a.inboundAllowIPv6.Match(ip)
 		}
 
-		// 只有明确匹配到 Deny 且没有更具体的 Allow 时才拒绝
-		return action == ActionDeny
+		// deny_inbound 中的 ! 例外已由 LPM 体现在 denyAction 中。
+		if denyAction == ActionDeny {
+			return true
+		}
+		return a.inboundAllowEnabled && allowAction != ActionAllow
 
 	} else if direction == "outbound" {
 		// 首先，尝试将地址解析为 IP
@@ -276,6 +459,46 @@ func (a *ACL) ShouldDeny(address string, direction string) bool {
 	return false
 }
 
+// ShouldDenyOutbound checks an outbound target using its original host and
+// destination port. Effective deny_outbound rules take precedence over the
+// allow_outbound whitelist.
+func (a *ACL) ShouldDenyOutbound(host string, port int) bool {
+	if a == nil {
+		return false
+	}
+
+	_, normalizedHost, err := normalizeEndpointHost(host)
+	if err != nil {
+		// Invalid hosts cannot match a whitelist. In legacy deny-only mode the
+		// dial/resolve path will report the malformed host as before.
+		return a.outboundAllowEnabled
+	}
+	if a.ShouldDeny(normalizedHost, "outbound") {
+		return true
+	}
+	if !a.outboundAllowEnabled {
+		return false
+	}
+	return !a.outboundAllow.match(normalizedHost, port)
+}
+
+// ShouldDenyOutboundAddress is a convenience wrapper for callers that have a
+// canonical host:port target, including upstream proxy paths.
+func (a *ACL) ShouldDenyOutboundAddress(address string) bool {
+	if a == nil {
+		return false
+	}
+	host, portStr, err := net.SplitHostPort(strings.TrimSpace(address))
+	if err != nil {
+		return true
+	}
+	port, err := strconv.Atoi(portStr)
+	if err != nil || port < 1 || port > 65535 {
+		return true
+	}
+	return a.ShouldDenyOutbound(host, port)
+}
+
 // LoadACL 从给定路径加载并解析 ACL 配置文件。
 func LoadACL(path string) (*ACL, error) {
 	file, err := os.Open(path)
@@ -285,16 +508,21 @@ func LoadACL(path string) (*ACL, error) {
 	defer file.Close()
 
 	acl := &ACL{
-		inboundIPv4:  newRadixTree(),
-		inboundIPv6:  newRadixTree(),
-		outboundIPv4: newRadixTree(),
-		outboundIPv6: newRadixTree(),
-		outbound:     newDomainMatcher(),
+		inboundIPv4:      newRadixTree(),
+		inboundIPv6:      newRadixTree(),
+		inboundAllowIPv4: newRadixTree(),
+		inboundAllowIPv6: newRadixTree(),
+		outboundIPv4:     newRadixTree(),
+		outboundIPv6:     newRadixTree(),
+		outbound:         newDomainMatcher(),
+		outboundAllow:    newEndpointAllowlist(),
 	}
 
 	scanner := bufio.NewScanner(file)
 	var currentSection string
+	lineNumber := 0
 	for scanner.Scan() {
+		lineNumber++
 		line := strings.TrimSpace(scanner.Text())
 		// 跳过空行和注释
 		if len(line) == 0 || line[0] == '#' || line[0] == ';' {
@@ -303,7 +531,13 @@ func LoadACL(path string) (*ACL, error) {
 
 		// 解析区域标记
 		if strings.HasPrefix(line, "[") && strings.HasSuffix(line, "]") {
-			currentSection = strings.ToLower(line[1 : len(line)-1])
+			currentSection = strings.ToLower(strings.TrimSpace(line[1 : len(line)-1]))
+			switch currentSection {
+			case "allow_inbound":
+				acl.inboundAllowEnabled = true
+			case "allow_outbound":
+				acl.outboundAllowEnabled = true
+			}
 			continue
 		}
 
@@ -354,6 +588,25 @@ func LoadACL(path string) (*ACL, error) {
 				}
 			}
 
+		case "allow_inbound":
+			if isException {
+				return nil, fmt.Errorf("%s:%d: allow_inbound does not support ! exception rules", path, lineNumber)
+			}
+			ipNet, ok := parseIPNet(cleanLine)
+			if !ok {
+				return nil, fmt.Errorf("%s:%d: allow_inbound requires an IP or CIDR, got %q", path, lineNumber, line)
+			}
+			if ipv4 := ipNet.IP.To4(); ipv4 != nil {
+				ipNet.IP = ipv4
+				acl.inboundAllowIPv4.Insert(ipNet, ActionAllow)
+			} else {
+				ipNet.IP = ipNet.IP.To16()
+				if ipNet.IP == nil {
+					return nil, fmt.Errorf("%s:%d: invalid allow_inbound IP %q", path, lineNumber, line)
+				}
+				acl.inboundAllowIPv6.Insert(ipNet, ActionAllow)
+			}
+
 		case "deny_outbound":
 			// 尝试将该行解析为 IP/CIDR
 			if ipNet, ok := parseIPNet(cleanLine); ok {
@@ -373,6 +626,16 @@ func LoadACL(path string) (*ACL, error) {
 				// 为了保持一致性，我们直接传入原始行 (含 !)，让 AddRule 处理
 				acl.outbound.AddRule(line)
 			}
+
+		case "allow_outbound":
+			if isException {
+				return nil, fmt.Errorf("%s:%d: allow_outbound does not support ! exception rules", path, lineNumber)
+			}
+			key, ports, err := parseOutboundAllowRule(line)
+			if err != nil {
+				return nil, fmt.Errorf("%s:%d: invalid allow_outbound rule %q: %w", path, lineNumber, line, err)
+			}
+			acl.outboundAllow.add(key, ports)
 		}
 	}
 
@@ -380,6 +643,7 @@ func LoadACL(path string) (*ACL, error) {
 		return nil, err
 	}
 
+	acl.outboundAllow.finalize()
 	return acl, nil
 }
 
@@ -387,14 +651,14 @@ func ACL_inbound_allow(acl *ACL, remoteAddr net.Addr) bool {
 	if acl == nil {
 		return true // 没有设置访问控制，默认允许所有连接
 	}
+	if remoteAddr == nil {
+		return !acl.inboundAllowEnabled
+	}
 	host, _, err := net.SplitHostPort(remoteAddr.String())
 	if err != nil {
-		return true // 如果解析失败，默认允许连接
+		return !acl.inboundAllowEnabled
 	}
-	if !acl.ShouldDeny(host, "inbound") {
-		return true
-	}
-	return false
+	return !acl.ShouldDeny(host, "inbound")
 }
 
 // ResolveAddrWithACL 解析地址，根据 localIPs 的优先级选择最佳的本地和远程地址对
@@ -406,8 +670,13 @@ func ResolveAddrWithACL(ctx context.Context, acl *ACL, network string, localIPs 
 		return nil, nil, false, fmt.Errorf("invalid address format: %w", err)
 	}
 	port, err := strconv.Atoi(portStr)
-	if err != nil {
-		return nil, nil, false, fmt.Errorf("invalid port: %w", err)
+	if err != nil || port < 1 || port > 65535 {
+		return nil, nil, false, fmt.Errorf("invalid port %q: must be between 1 and 65535", portStr)
+	}
+
+	// 白名单匹配原始请求的 host+port；deny_outbound 仍然优先。
+	if acl != nil && acl.ShouldDenyOutbound(host, port) {
+		return nil, nil, true, fmt.Errorf("ACL rule denied access to target: %s", address)
 	}
 
 	// 1. 获取候选的远程 IP 列表 (remoteCandidates)
@@ -418,11 +687,6 @@ func ResolveAddrWithACL(ctx context.Context, acl *ACL, network string, localIPs 
 	if ip != nil {
 		remoteCandidates = []net.IP{ip}
 	} else {
-		// 这是一个域名，执行 ACL 域名检查
-		if acl != nil && acl.ShouldDeny(host, "outbound") {
-			return nil, nil, true, fmt.Errorf("ACL rule denied access to domain: %s", host)
-		}
-
 		// 确定 DNS 查询的网络类型
 		var ipNetwork string
 		switch network {

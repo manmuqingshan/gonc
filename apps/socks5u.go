@@ -1070,6 +1070,10 @@ func handleLocalUDPToTunnel(config *Socks5uConfig, localUDPConn net.PacketConn, 
 func handleDirectTCPConnect(config *Socks5uConfig, clientConn net.Conn, targetHost string, targetPort int) error {
 	targetAddr := net.JoinHostPort(targetHost, strconv.Itoa(targetPort))
 	if config.Outbound != nil {
+		if config.AccessCtrl != nil && config.AccessCtrl.ShouldDenyOutbound(targetHost, targetPort) {
+			sendSocks5Response(clientConn, REP_CONNECTION_NOT_ALLOWED, "0.0.0.0", 0)
+			return fmt.Errorf("access denied by ACL for %s", targetAddr)
+		}
 		config.Logger.Printf(
 			"TCP: %s->%s connecting via upstream proxy...",
 			clientConn.RemoteAddr(),
@@ -1385,7 +1389,12 @@ func handleRemoteTCPConnect(config *Socks5uConfig, tunnelStream net.Conn, target
 	var err error
 
 	if config.TunnelUpstreamConfig != nil {
-		// 走 upstream：跳过 ACL，域名交给 upstream 解析
+		// 上游负责 DNS，因此这里只能检查原始 host+port 和 host 级 deny 规则。
+		if config.AccessCtrl != nil && config.AccessCtrl.ShouldDenyOutboundAddress(targetAddr) {
+			config.Logger.Printf("Access control denied for upstream target %s", targetAddr)
+			tunnelStream.Write([]byte("ERROR: Access denied\n"))
+			return
+		}
 		proxyClient, pcErr := NewProxyClient(config.TunnelUpstreamConfig)
 		if pcErr != nil {
 			config.Logger.Printf("Failed to create upstream proxy client for %s: %v", targetAddr, pcErr)
@@ -1581,6 +1590,11 @@ func handleRemoteUDPViaUpstream(config *Socks5uConfig, tunnelStream net.Conn) {
 				dataOffset = 22
 			default:
 				config.Logger.Printf("Unsupported UDP ATYP from tunnel: %d", atyp)
+				continue
+			}
+
+			if config.AccessCtrl != nil && config.AccessCtrl.ShouldDenyOutbound(targetHost, targetPort) {
+				config.Logger.Printf("ACL denied upstream UDP to %s:%d", targetHost, targetPort)
 				continue
 			}
 
