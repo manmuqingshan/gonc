@@ -1814,7 +1814,7 @@ func tcpActiveDialDelay(isClient, inSameLAN, lanProbeOnly bool) time.Duration {
 
 const tcpUnsynchronizedSameLANRetryInterval = 250 * time.Millisecond
 
-const lanProbeErrorGracePeriod = time.Second
+const tcpTraversalErrorGracePeriod = time.Second
 
 func reportTraversalError(ctx context.Context, errCh chan<- error, err error, grace time.Duration) {
 	if err == nil {
@@ -1993,12 +1993,12 @@ func Auto_P2P_TCP_NAT_Traversal(ctx context.Context, network, sessionUid string,
 	}
 	connChan := make(chan ConnWithTag)
 	errChan := make(chan error, 1)
-	errorGrace := time.Duration(0)
-	if p2pInfo.LANProbeOnly {
-		errorGrace = lanProbeErrorGracePeriod
-	}
 	reportErr := func(err error) {
-		reportTraversalError(attemptCtx, errChan, err, errorGrace)
+		// Accept and dialing run concurrently. A dial-side terminal error can race
+		// with an accepted connection that has completed the punch ACK but has not
+		// yet been committed to connChan. Give every TCP traversal a short,
+		// cancelable grace period so that a successful commit wins that race.
+		reportTraversalError(attemptCtx, errChan, err, tcpTraversalErrorGracePeriod)
 	}
 	punchAckPayload := []byte(deriveKeyForPayload(sessionUid, false))
 	var punchAckSelector tcpPunchAckSelector

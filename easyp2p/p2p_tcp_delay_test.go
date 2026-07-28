@@ -94,9 +94,9 @@ func TestTCPUnsynchronizedSameLANRetryInterval(t *testing.T) {
 	}
 }
 
-func TestLANProbeErrorGracePeriod(t *testing.T) {
-	if lanProbeErrorGracePeriod != time.Second {
-		t.Fatalf("LAN probe error grace = %s, want 1s", lanProbeErrorGracePeriod)
+func TestTCPTraversalErrorGracePeriod(t *testing.T) {
+	if tcpTraversalErrorGracePeriod != time.Second {
+		t.Fatalf("TCP traversal error grace = %s, want 1s", tcpTraversalErrorGracePeriod)
 	}
 }
 
