@@ -67,6 +67,7 @@ const (
 	mqttPublishKeepAlive      = 5 * time.Second
 	mqttPublishTickerInterval = 2 * time.Second
 	mqttConnectTimeout        = 15 * time.Second
+	mqttInitialConnectTimeout = 15 * time.Second
 	mqttWriteTimeout          = 5 * time.Second
 	mqttSubscribeTimeout      = 10 * time.Second
 	mqttPrepareTopicsTimeout  = 25 * time.Second
@@ -152,36 +153,56 @@ func newMQTTSignalSession(ctx context.Context, brokerServers []string, clientID,
 		go s.connectBroker(serverURL, q, i, dialer, ready, fail)
 	}
 
-	successOrAllFail := make(chan struct{})
-	go func() {
-		failCount := 0
-		for {
-			select {
-			case <-ready:
-				successOrAllFail <- struct{}{}
-				return
-			case <-fail:
-				failCount++
-				if failCount == len(brokerServers) {
-					successOrAllFail <- struct{}{}
-					return
-				}
-			case <-sctx.Done():
-				return
-			}
-		}
-	}()
-
-	select {
-	case <-successOrAllFail:
-	case <-sctx.Done():
-	}
-
-	if len(s.clientsSnapshot()) == 0 {
-		s.Close()
-		return nil, fmt.Errorf("failed to connect to any MQTT broker")
+	if err := s.waitForFirstConnection(ready, fail); err != nil {
+		return nil, err
 	}
 	return s, nil
+}
+
+func (s *MQTTSignalSession) waitForFirstConnection(ready, fail <-chan struct{}) (err error) {
+	// This deadline bounds only startup, not the lifetime of a usable session.
+	ctx, cancel := context.WithTimeout(s.ctx, mqttInitialConnectTimeout)
+	defer cancel()
+	defer func() {
+		if err != nil {
+			s.cancel()
+			s.Close()
+		}
+	}()
+	started := time.Now()
+	failCount := 0
+	for {
+		if cause := context.Cause(ctx); cause != nil {
+			return s.initialConnectionError(started, cause)
+		}
+		select {
+		case <-ready:
+			if cause := context.Cause(ctx); cause != nil {
+				return s.initialConnectionError(started, cause)
+			}
+			return nil
+		case <-fail:
+			failCount++
+			if failCount == len(s.brokers) {
+				return s.initialConnectionError(started, fmt.Errorf("all broker connection attempts ended"))
+			}
+		case <-ctx.Done():
+		}
+	}
+}
+
+func (s *MQTTSignalSession) initialConnectionError(started time.Time, cause error) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	details := make([]string, 0, len(s.brokers))
+	for index := range s.brokers {
+		status := "connection not confirmed"
+		if failure := s.failures[mqttSignalFailureKey{broker: index}]; failure != nil && failure.lastErr != nil {
+			status = fmt.Sprintf("last connection error: %v", failure.lastErr)
+		}
+		details = append(details, fmt.Sprintf("%s: %s", s.brokerName(index), status))
+	}
+	return fmt.Errorf("MQTT initial connection failed after %s: %w (%s)", time.Since(started).Round(time.Millisecond), cause, strings.Join(details, "; "))
 }
 
 func (s *MQTTSignalSession) connectBroker(brokerAddr string, qvals url.Values, index int, dialer *net.Dialer, ready, fail chan<- struct{}) {
@@ -237,10 +258,17 @@ func (s *MQTTSignalSession) connectBroker(brokerAddr string, qvals url.Values, i
 
 	client := mqtt.NewClient(opts)
 	s.mu.Lock()
+	if s.closed || s.ctx.Err() != nil {
+		s.mu.Unlock()
+		return
+	}
 	s.allClients = append(s.allClients, client)
+	// Register and start atomically with respect to Close, so it cannot miss
+	// this client or disconnect it before Connect starts. Connect is async.
+	token := client.Connect()
 	s.mu.Unlock()
 
-	if err := waitMQTTTokenContext(s.ctx, client.Connect()); err != nil {
+	if err := waitMQTTTokenContext(s.ctx, token); err != nil {
 		select {
 		case fail <- struct{}{}:
 		case <-s.ctx.Done():
