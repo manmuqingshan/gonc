@@ -3537,7 +3537,7 @@ func Mqtt_ensure_ready(ncconfig *AppNetcatConfig, reportSessionID string) (strin
 
 	if ncconfig.useMQTTHello {
 		ReportP2PStatus(ncconfig, reportSessionID, "wait", ncconfig.network, "", "")
-		salt, signal, err = easyp2p.MQTTHelloSession(ncconfig.ctx, ncconfig.p2pSessionKey, ncconfig.localbindIP, ncconfig.MQTTHelloPayload, 15*time.Second, ncconfig.LogWriter)
+		salt, signal, err = easyp2p.MQTTHelloSession(ncconfig.ctx, ncconfig.p2pSessionKey, ncconfig.localbindIP, ncconfig.MQTTHelloPayload, 30*time.Second, ncconfig.LogWriter)
 		if err != nil {
 			return "", nil, fmt.Errorf("mqtt-hello: %v", err)
 		}

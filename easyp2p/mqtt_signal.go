@@ -8,6 +8,7 @@ import (
 	"log"
 	"net"
 	"net/url"
+	"strings"
 	"sync"
 	"time"
 
@@ -21,6 +22,7 @@ type mqttSignalRecvPayload struct {
 }
 
 type mqttSignalWaiter struct {
+	diagnostics mqttReceiveDiagnostics
 	selfPayload string
 	handler     func(string) (bool, error)
 	recvCh      chan mqttSignalRecvPayload
@@ -30,6 +32,22 @@ type mqttSignalWaiter struct {
 type mqttSignalClient struct {
 	client mqtt.Client
 	index  int
+}
+
+type mqttSubscriptionAttempt struct {
+	cancel context.CancelFunc
+	done   bool
+}
+
+type mqttSignalFailureKey struct {
+	broker int
+	topic  string // Empty for a connection attempt, which affects every topic.
+}
+
+type mqttSignalFailure struct {
+	count   int
+	alerted bool
+	lastErr error
 }
 
 func waitMQTTTokenContext(ctx context.Context, token mqtt.Token) error {
@@ -46,10 +64,13 @@ func waitMQTTTokenContext(ctx context.Context, token mqtt.Token) error {
 
 const (
 	mqttNoPreferredBroker     = -1
-	mqttPublishSettleWindow   = 500 * time.Millisecond
-	mqttPreferredBrokerWindow = 800 * time.Millisecond
 	mqttPublishKeepAlive      = 5 * time.Second
 	mqttPublishTickerInterval = 2 * time.Second
+	mqttConnectTimeout        = 15 * time.Second
+	mqttWriteTimeout          = 5 * time.Second
+	mqttSubscribeTimeout      = 10 * time.Second
+	mqttPrepareTopicsTimeout  = 25 * time.Second
+	mqttSubscribeRetryMax     = 10 * time.Second
 )
 
 var mqttPublishBurstDelays = []time.Duration{
@@ -74,7 +95,10 @@ type MQTTSignalSession struct {
 	allClients    []mqtt.Client
 	subscriptions map[string]byte
 	subscribed    map[string]map[int]struct{}
+	subscribing   map[string]map[int]*mqttSubscriptionAttempt
+	subChanged    chan struct{}
 	loggedSubs    map[string]struct{}
+	failures      map[mqttSignalFailureKey]*mqttSignalFailure
 	waiters       map[string]map[*mqttSignalWaiter]struct{}
 	pending       map[string]mqttSignalRecvPayload
 	closed        bool
@@ -115,7 +139,7 @@ func newMQTTSignalSession(ctx context.Context, brokerServers []string, clientID,
 	fail := make(chan struct{}, len(brokerServers))
 
 	dialer := &net.Dialer{
-		Timeout: 30 * time.Second,
+		Timeout: mqttConnectTimeout,
 	}
 	if localIP != "" {
 		if ip := net.ParseIP(localIP); ip != nil {
@@ -170,7 +194,8 @@ func (s *MQTTSignalSession) connectBroker(brokerAddr string, qvals url.Values, i
 	opts := mqtt.NewClientOptions().
 		AddBroker(brokerAddr).
 		SetClientID(s.clientID).
-		SetConnectTimeout(5 * time.Second).
+		SetConnectTimeout(mqttConnectTimeout).
+		SetWriteTimeout(mqttWriteTimeout).
 		SetAutoReconnect(true).
 		SetConnectRetry(true).
 		SetConnectRetryInterval(3 * time.Second).
@@ -197,10 +222,17 @@ func (s *MQTTSignalSession) connectBroker(brokerAddr string, qvals url.Values, i
 	}
 
 	opts.OnConnect = func(c mqtt.Client) {
-		if s.ctx.Err() != nil {
-			return
+		s.brokerConnected(c, index)
+		select {
+		case ready <- struct{}{}:
+		default:
 		}
-		s.resubscribeClient(c, index)
+	}
+	opts.OnConnectionLost = func(c mqtt.Client, err error) {
+		s.brokerConnectionLost(c, index, err)
+	}
+	opts.OnConnectionNotification = func(_ mqtt.Client, notification mqtt.ConnectionNotification) {
+		s.connectionNotification(index, notification)
 	}
 
 	client := mqtt.NewClient(opts)
@@ -216,27 +248,90 @@ func (s *MQTTSignalSession) connectBroker(brokerAddr string, qvals url.Values, i
 		return
 	}
 
+	if s.ctx.Err() != nil {
+		client.Disconnect(250)
+	}
+}
+
+func (s *MQTTSignalSession) brokerConnected(c mqtt.Client, index int) {
 	s.mu.Lock()
 	if s.closed || s.ctx.Err() != nil {
 		s.mu.Unlock()
-		client.Disconnect(250)
 		return
 	}
-	s.clients = append(s.clients, mqttSignalClient{client: client, index: index})
-	topics := make(map[string]byte, len(s.subscriptions))
+	s.invalidateSubscriptionsLocked(index)
+	if failure := s.failures[mqttSignalFailureKey{broker: index}]; failure != nil {
+		// Connection recovery resets the streak, but an alert is only resolved
+		// when a subscription has actually become usable again.
+		failure.count, failure.lastErr = 0, nil
+	}
+	found := false
+	for _, client := range s.clients {
+		found = found || client.index == index
+	}
+	if !found {
+		s.clients = append(s.clients, mqttSignalClient{client: c, index: index})
+	}
 	for topic, qos := range s.subscriptions {
-		topics[topic] = qos
+		s.ensureSubscriptionLocked(c, index, topic, qos)
 	}
 	s.mu.Unlock()
+}
 
-	s.logger.Printf("broker connected: %s (%d/%d)\n", brokerAddr, index+1, len(s.brokers))
-	for topic, qos := range topics {
-		s.subscribeClient(s.ctx, client, index, topic, qos)
+func (s *MQTTSignalSession) connectionNotification(index int, notification mqtt.ConnectionNotification) {
+	// Paho emits BrokerFailed and Failed for one failed connection attempt.
+	// Count only the latter, including failures during the MQTT handshake.
+	failed, ok := notification.(mqtt.ConnectionNotificationFailed)
+	if !ok {
+		return
 	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.closed || s.ctx.Err() != nil {
+		return
+	}
+	s.noteSubscriptionFailureLocked("", index, failed.Reason)
+}
 
-	select {
-	case ready <- struct{}{}:
-	case <-s.ctx.Done():
+func (s *MQTTSignalSession) failureLocked(topic string, index int) *mqttSignalFailure {
+	if s.failures == nil {
+		s.failures = make(map[mqttSignalFailureKey]*mqttSignalFailure)
+	}
+	key := mqttSignalFailureKey{broker: index, topic: topic}
+	if s.failures[key] == nil {
+		s.failures[key] = &mqttSignalFailure{}
+	}
+	return s.failures[key]
+}
+
+func (s *MQTTSignalSession) noteSubscriptionFailureLocked(topic string, index int, err error) {
+	failure := s.failureLocked(topic, index)
+	failure.count++
+	failure.lastErr = err
+	if failure.count < 3 || failure.alerted {
+		return
+	}
+	failure.alerted = true
+	if topic == "" {
+		s.logger.Printf("broker unavailable for subscription: %s; consecutive_failures=%d; reason=connect: %v\n", s.brokerName(index), failure.count, err)
+	} else {
+		s.logger.Printf("subscribe failed: topic=%s broker=%s; consecutive_failures=%d; reason=%v\n", topic, s.brokerName(index), failure.count, err)
+	}
+}
+
+func (s *MQTTSignalSession) subscriptionRecoveredLocked(topic string, index int) {
+	for _, scope := range []string{"", topic} {
+		key := mqttSignalFailureKey{broker: index, topic: scope}
+		if failure := s.failures[key]; failure != nil {
+			if failure.alerted {
+				if scope == "" {
+					s.logger.Printf("broker subscription recovered: %s\n", s.brokerName(index))
+				} else {
+					s.logger.Printf("subscription recovered: topic=%s via %s\n", topic, s.brokerName(index))
+				}
+			}
+			delete(s.failures, key)
+		}
 	}
 }
 
@@ -268,37 +363,81 @@ func (s *MQTTSignalSession) clientsSnapshot() []mqttSignalClient {
 	return out
 }
 
-func (s *MQTTSignalSession) resubscribeClient(c mqtt.Client, index int) {
+func (s *MQTTSignalSession) brokerConnectionLost(c mqtt.Client, index int, reason error) {
 	s.mu.Lock()
-	topics := make(map[string]byte, len(s.subscriptions))
+	s.invalidateSubscriptionsLocked(index)
+	if s.closed || s.ctx.Err() != nil {
+		s.mu.Unlock()
+		return
+	}
+	// Preserve the reason for a final diagnostic, without treating one loss
+	// as multiple failed subscriptions or as a failed reconnect attempt.
+	s.failureLocked("", index).lastErr = reason
+	// Paho dispatches callbacks asynchronously. If reconnection already
+	// finished, replace invalidated subscriptions before waking callers.
 	for topic, qos := range s.subscriptions {
-		topics[topic] = qos
+		s.ensureSubscriptionLocked(c, index, topic, qos)
 	}
 	s.mu.Unlock()
+}
 
-	for topic, qos := range topics {
-		s.subscribeClient(s.ctx, c, index, topic, qos)
+func (s *MQTTSignalSession) subscriptionStatusLocked(topic string) string {
+	details := make([]string, 0, len(s.brokers))
+	for index := range s.brokers {
+		status := "not subscribed"
+		if _, ok := s.subscribed[topic][index]; ok {
+			status = "subscribed"
+		} else if failure := s.failures[mqttSignalFailureKey{broker: index, topic: topic}]; failure != nil && failure.lastErr != nil {
+			status = fmt.Sprintf("last subscribe error: %v", failure.lastErr)
+		} else if failure := s.failures[mqttSignalFailureKey{broker: index}]; failure != nil && failure.lastErr != nil {
+			status = fmt.Sprintf("last connection error: %v", failure.lastErr)
+		}
+		details = append(details, fmt.Sprintf("%s: %s", s.brokerName(index), status))
 	}
+	return strings.Join(details, "; ")
+}
+
+func (s *MQTTSignalSession) signalError(stage, topic string, cause error) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return fmt.Errorf("MQTT %s for topic %s: %w (%s)", stage, topic, cause, s.subscriptionStatusLocked(topic))
 }
 
 func (s *MQTTSignalSession) brokerName(index int) string {
 	if index < 0 || index >= len(s.brokers) {
 		return fmt.Sprintf("broker#%d", index)
 	}
-	broker, _, err := ParseMQTTServerV3(s.brokers[index])
-	if err != nil {
-		return s.brokers[index]
+	address := s.brokers[index]
+	if !strings.Contains(address, "://") {
+		address = "//" + address
 	}
-	return broker
+	broker, err := url.Parse(address)
+	if err == nil && broker.Hostname() != "" {
+		return broker.Hostname()
+	}
+	// Never fall back to the raw URL, which can contain credentials.
+	return fmt.Sprintf("broker#%d", index)
 }
 
-func (s *MQTTSignalSession) markSubscribed(topic string, index int) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	if s.subscribed[topic] == nil {
-		s.subscribed[topic] = make(map[int]struct{})
+func (s *MQTTSignalSession) invalidateSubscriptionsLocked(index int) {
+	for _, brokers := range s.subscribed {
+		delete(brokers, index)
 	}
-	s.subscribed[topic][index] = struct{}{}
+	for _, attempts := range s.subscribing {
+		if attempt := attempts[index]; attempt != nil {
+			attempt.cancel()
+			delete(attempts, index)
+		}
+	}
+	s.notifySubscriptionsLocked()
+}
+
+// Wake every caller waiting for any broker, including brokers connected later.
+func (s *MQTTSignalSession) notifySubscriptionsLocked() {
+	if s.subChanged != nil {
+		close(s.subChanged)
+	}
+	s.subChanged = make(chan struct{})
 }
 
 func (s *MQTTSignalSession) subscribedCount(topic string) int {
@@ -308,58 +447,171 @@ func (s *MQTTSignalSession) subscribedCount(topic string) int {
 }
 
 func (s *MQTTSignalSession) subscribe(ctx context.Context, topic string, qos byte) error {
+	if cause := context.Cause(ctx); cause != nil {
+		return cause
+	}
 	s.mu.Lock()
 	if s.closed {
 		s.mu.Unlock()
 		return fmt.Errorf("MQTT signal session closed")
 	}
 	s.subscriptions[topic] = qos
-	clients := make([]mqttSignalClient, len(s.clients))
-	copy(clients, s.clients)
-	s.mu.Unlock()
-
-	success := 0
-	for _, client := range clients {
-		if s.subscribeClient(ctx, client.client, client.index, topic, qos) {
-			success++
+	for _, client := range s.clients {
+		s.ensureSubscriptionLocked(client.client, client.index, topic, qos)
+	}
+	if s.subChanged == nil {
+		s.subChanged = make(chan struct{})
+	}
+	for {
+		if cause := context.Cause(ctx); cause != nil {
+			s.mu.Unlock()
+			return s.signalError("subscription", topic, cause)
 		}
-	}
-	if cause := context.Cause(ctx); cause != nil {
-		return cause
-	}
-	if success == 0 {
-		s.mu.Lock()
-		delete(s.subscriptions, topic)
-		delete(s.subscribed, topic)
-		delete(s.loggedSubs, topic)
+		if s.closed || s.ctx.Err() != nil {
+			s.mu.Unlock()
+			return fmt.Errorf("MQTT signal session closed")
+		}
+		success := len(s.subscribed[topic])
+		if success > 0 {
+			s.mu.Unlock()
+			return nil
+		}
+		// With no connected brokers, wait for OnConnect to restore the topic.
+		// The caller's deadline still bounds this wait.
+		changed := s.subChanged
 		s.mu.Unlock()
-		return fmt.Errorf("failed to subscribe MQTT topic %s", topic)
+		select {
+		case <-changed:
+		case <-ctx.Done():
+			return s.signalError("subscription", topic, context.Cause(ctx))
+		case <-s.ctx.Done():
+			return fmt.Errorf("MQTT signal session closed")
+		}
+		s.mu.Lock()
 	}
-	s.mu.Lock()
-	_, logged := s.loggedSubs[topic]
-	if !logged {
-		s.loggedSubs[topic] = struct{}{}
-	}
-	s.mu.Unlock()
-	if !logged {
-		s.logger.Printf("subscribed topic %s via %d/%d brokers\n", topic, success, len(s.brokers))
-	}
-	return nil
 }
 
 func (s *MQTTSignalSession) prepareTopic(ctx context.Context, topicSalt, sessionUid string) error {
 	return s.subscribe(ctx, topicFromSaltAndSessionUid(topicSalt, sessionUid), 1)
 }
 
-func (s *MQTTSignalSession) subscribeClient(ctx context.Context, c mqtt.Client, index int, topic string, qos byte) bool {
-	token := c.Subscribe(topic, qos, func(_ mqtt.Client, msg mqtt.Message) {
-		s.dispatchMessage(msg.Topic(), index, string(msg.Payload()))
-	})
-	ok := waitMQTTTokenContext(ctx, token) == nil
-	if ok {
-		s.markSubscribed(topic, index)
+func (s *MQTTSignalSession) prepareP2PTopics(ctx context.Context, sessionUid string) error {
+	// Both topics share one preparation budget, separate from STUN and the
+	// later exchanges. Session-owned subscription retries outlive this wait.
+	ctx, cancel := context.WithTimeout(ctx, mqttPrepareTopicsTimeout)
+	defer cancel()
+	for _, phase := range []string{"address", "sync"} {
+		if err := s.prepareTopic(ctx, "gonc-exchange-"+phase, sessionUid); err != nil {
+			return fmt.Errorf("failed to prepare MQTT %s topic: %w", phase, err)
+		}
 	}
-	return ok
+	return nil
+}
+
+func (s *MQTTSignalSession) prepareP2PTopicsInBackground(ctx context.Context, sessionUid string) func() {
+	ctx, cancel := context.WithCancel(ctx)
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		// Preparation is opportunistic. Each exchange waits for its own topic
+		// with its own deadline and reports any subscription failure there.
+		_ = s.prepareP2PTopics(ctx, sessionUid)
+	}()
+	return func() {
+		cancel()
+		<-done
+	}
+}
+
+// Share both completed subscriptions and in-flight requests across exchanges.
+// Workers belong to the session, so returning after the first success does not
+// cancel subscriptions on other brokers.
+func (s *MQTTSignalSession) ensureSubscriptionLocked(c mqtt.Client, index int, topic string, qos byte) {
+	if !c.IsConnectionOpen() {
+		delete(s.subscribed[topic], index)
+		return
+	}
+	if _, ok := s.subscribed[topic][index]; ok {
+		return
+	}
+	if s.subscribing == nil {
+		s.subscribing = make(map[string]map[int]*mqttSubscriptionAttempt)
+	}
+	if s.subscribing[topic] == nil {
+		s.subscribing[topic] = make(map[int]*mqttSubscriptionAttempt)
+	}
+	if attempt := s.subscribing[topic][index]; attempt != nil && !attempt.done {
+		return
+	}
+	ctx, cancel := context.WithCancel(s.ctx)
+	attempt := &mqttSubscriptionAttempt{cancel: cancel}
+	s.subscribing[topic][index] = attempt
+	go s.runSubscription(ctx, c, index, topic, qos, attempt)
+}
+
+func (s *MQTTSignalSession) runSubscription(ctx context.Context, c mqtt.Client, index int, topic string, qos byte, attempt *mqttSubscriptionAttempt) {
+	defer attempt.cancel()
+	defer func() {
+		s.mu.Lock()
+		defer s.mu.Unlock()
+		if s.subscribing[topic][index] == attempt {
+			attempt.done = true
+			s.notifySubscriptionsLocked()
+		}
+	}()
+	delay := time.Second
+	for {
+		s.mu.Lock()
+		current := s.subscribing[topic][index] == attempt && !s.closed && ctx.Err() == nil
+		s.mu.Unlock()
+		if !current || !c.IsConnectionOpen() {
+			return
+		}
+		requestCtx, cancel := context.WithTimeout(ctx, mqttSubscribeTimeout)
+		token := c.Subscribe(topic, qos, func(_ mqtt.Client, msg mqtt.Message) {
+			s.dispatchMessage(msg.Topic(), index, string(msg.Payload()))
+		})
+		err := waitMQTTTokenContext(requestCtx, token)
+		cancel()
+		if err == nil {
+			if result, ok := token.(interface{ Result() map[string]byte }); ok && result.Result()[topic] == 0x80 {
+				err = fmt.Errorf("broker rejected MQTT subscription to %s", topic)
+			}
+		}
+		s.mu.Lock()
+		// A reconnect replaces the worker; its old token cannot mark the new
+		// connection ready, count a failure, or start another retry.
+		if s.subscribing[topic][index] != attempt || s.closed || ctx.Err() != nil || !c.IsConnectionOpen() {
+			s.mu.Unlock()
+			return
+		}
+		if err == nil {
+			if s.subscribed[topic] == nil {
+				s.subscribed[topic] = make(map[int]struct{})
+			}
+			s.subscribed[topic][index] = struct{}{}
+			if s.loggedSubs == nil {
+				s.loggedSubs = make(map[string]struct{})
+			}
+			if _, logged := s.loggedSubs[topic]; !logged {
+				s.loggedSubs[topic] = struct{}{}
+				s.logger.Printf("subscribed topic %s via %s\n", topic, s.brokerName(index))
+			}
+			s.subscriptionRecoveredLocked(topic, index)
+			s.mu.Unlock()
+			return
+		}
+		s.noteSubscriptionFailureLocked(topic, index, err)
+		s.mu.Unlock()
+		timer := time.NewTimer(delay)
+		select {
+		case <-ctx.Done():
+			timer.Stop()
+			return
+		case <-timer.C:
+		}
+		delay = min(delay*2, mqttSubscribeRetryMax)
+	}
 }
 
 func (s *MQTTSignalSession) addWaiter(topic string, waiter *mqttSignalWaiter) func() {
@@ -412,11 +664,17 @@ func (s *MQTTSignalSession) dispatchMessage(topic string, index int, data string
 
 func (s *MQTTSignalSession) deliverMessage(waiter *mqttSignalWaiter, topic string, index int, data string) {
 	if data == waiter.selfPayload {
+		waiter.diagnostics.mu.Lock()
+		waiter.diagnostics.self++
+		waiter.diagnostics.mu.Unlock()
 		return
 	}
 	if waiter.handler != nil {
 		ok, err := waiter.handler(data)
 		if err != nil {
+			waiter.diagnostics.mu.Lock()
+			waiter.diagnostics.handlerErrors++
+			waiter.diagnostics.mu.Unlock()
 			select {
 			case waiter.errCh <- fmt.Errorf("handling message error from broker %d on topic %s: %w", index, topic, err):
 			default:
@@ -424,17 +682,27 @@ func (s *MQTTSignalSession) deliverMessage(waiter *mqttSignalWaiter, topic strin
 			return
 		}
 		if !ok {
+			waiter.diagnostics.mu.Lock()
+			waiter.diagnostics.filtered++
+			waiter.diagnostics.mu.Unlock()
 			return
 		}
 	}
+	waiter.diagnostics.mu.Lock()
+	defer waiter.diagnostics.mu.Unlock()
+	waiter.diagnostics.valid++
 	select {
 	case waiter.recvCh <- mqttSignalRecvPayload{data: data, index: index}:
+		if waiter.diagnostics.enqueued == 0 {
+			waiter.diagnostics.firstQueuedBroker = index
+		}
+		waiter.diagnostics.enqueued++
 	default:
 	}
 }
 
-func publishAtLeastN(ctx context.Context, clients []mqttSignalClient, topic string, qos byte, payload string, minSuccess int, settleWindow time.Duration) int {
-	if len(clients) == 0 {
+func publishAtLeastN(ctx context.Context, clients []mqttSignalClient, topic string, qos byte, payload string, minSuccess int, diagnostics *mqttPublishDiagnostics) int {
+	if ctx.Err() != nil || len(clients) == 0 {
 		return 0
 	}
 	if minSuccess <= 0 || minSuccess > len(clients) {
@@ -446,40 +714,25 @@ func publishAtLeastN(ctx context.Context, clients []mqttSignalClient, topic stri
 
 	for _, c := range clients {
 		wg.Add(1)
-		go func(client mqtt.Client) {
+		go func(client mqttSignalClient) {
 			defer wg.Done()
-			token := client.Publish(topic, qos, false, payload)
+			if ctx.Err() != nil {
+				return
+			}
+			token := diagnostics.publish(client, topic, qos, payload)
 			if waitMQTTTokenContext(ctx, token) == nil {
 				select {
 				case successCh <- struct{}{}:
 				case <-ctx.Done():
 				}
 			}
-		}(c.client)
+		}(c)
 	}
 
 	go func() {
 		wg.Wait()
 		close(successCh)
 	}()
-
-	var timer <-chan time.Time
-	var stopTimer func()
-	if settleWindow > 0 {
-		t := time.NewTimer(settleWindow)
-		timer = t.C
-		stopTimer = func() {
-			if !t.Stop() {
-				select {
-				case <-t.C:
-				default:
-				}
-			}
-		}
-	} else {
-		stopTimer = func() {}
-	}
-	defer stopTimer()
 
 	count := 0
 	for {
@@ -489,39 +742,114 @@ func publishAtLeastN(ctx context.Context, clients []mqttSignalClient, topic stri
 				return count
 			}
 			count++
-			if settleWindow <= 0 && count >= minSuccess {
+			if count >= minSuccess {
 				return count
 			}
-		case <-timer:
-			return count
 		case <-ctx.Done():
 			return count
 		}
 	}
 }
 
-func (s *MQTTSignalSession) publish(ctx context.Context, topic string, qos byte, payload string, minSuccess int, settleWindow time.Duration) int {
-	return publishAtLeastN(ctx, s.clientsSnapshot(), topic, qos, payload, minSuccess, settleWindow)
+func (s *MQTTSignalSession) publish(ctx context.Context, topic string, qos byte, payload string, minSuccess int, diagnostics *mqttPublishDiagnostics) int {
+	return publishAtLeastN(ctx, s.clientsSnapshot(), topic, qos, payload, minSuccess, diagnostics)
 }
 
-func (s *MQTTSignalSession) publishPreferred(ctx context.Context, topic string, qos byte, payload string, preferredBrokerIndex int) int {
-	if preferredBrokerIndex < 0 {
-		return 0
+// Keep one pending publish per broker until its result is known. A slow PUBACK
+// remains eligible for success while other brokers and retries participate.
+func (s *MQTTSignalSession) publishReply(ctx context.Context, topic string, qos byte, payload string, preferredBrokerIndex int) (int, error) {
+	ctx, cancel := context.WithCancelCause(ctx)
+	stop := context.AfterFunc(s.ctx, func() { cancel(context.Cause(s.ctx)) })
+	defer stop()
+	defer cancel(context.Canceled)
+	started := time.Now()
+	diagnostics := &mqttPublishDiagnostics{}
+	type result struct {
+		index int
+		err   error
 	}
-	clients := s.clientsSnapshot()
-	preferredClients := make([]mqttSignalClient, 0, 1)
-	for _, client := range clients {
-		if client.index == preferredBrokerIndex {
-			preferredClients = append(preferredClients, client)
+	type state struct {
+		pending bool
+		err     error
+		retryAt time.Time
+	}
+	states := make(map[int]*state)
+	results := make(chan result)
+	ticker := time.NewTicker(mqttPublishTickerInterval)
+	defer ticker.Stop()
+	for {
+		if cause := context.Cause(ctx); cause != nil {
+			details := make([]string, 0, len(s.brokers))
+			for index := range s.brokers {
+				status := "not connected"
+				if st := states[index]; st != nil {
+					if st.pending {
+						status = "publish incomplete"
+					} else if st.err != nil {
+						status = st.err.Error()
+					}
+					if st.pending && st.err != nil {
+						status += "; last error: " + st.err.Error()
+					}
+				}
+				details = append(details, fmt.Sprintf("%s: %s", s.brokerName(index), status))
+			}
+			err := fmt.Errorf("MQTT reply publish unconfirmed after %s: %w (%s); %s", time.Since(started).Round(time.Millisecond), cause, strings.Join(details, "; "), diagnostics.summary(s))
+			s.logger.Printf("topic %s: %v\n", topic, err)
+			return -1, err
+		}
+		// Take the notification channel and client snapshot under the same lock
+		// so a newly connected broker cannot be missed between the two reads.
+		s.mu.Lock()
+		if s.subChanged == nil {
+			s.subChanged = make(chan struct{})
+		}
+		changed := s.subChanged
+		clients := append([]mqttSignalClient(nil), s.clients...)
+		s.mu.Unlock()
+		for i, client := range clients {
+			if client.index == preferredBrokerIndex {
+				clients[0], clients[i] = clients[i], clients[0]
+				break
+			}
+		}
+		for _, client := range clients {
+			st := states[client.index]
+			if st == nil {
+				st = &state{}
+				states[client.index] = st
+			}
+			if st.pending || time.Now().Before(st.retryAt) {
+				continue
+			}
+			if !client.client.IsConnectionOpen() {
+				st.err = fmt.Errorf("not connected")
+				continue
+			}
+			st.pending = true
+			go func() {
+				token := diagnostics.publish(client, topic, qos, payload)
+				err := waitMQTTTokenContext(ctx, token)
+				select {
+				case results <- result{index: client.index, err: err}:
+				case <-ctx.Done():
+				}
+			}()
+		}
+		select {
+		case r := <-results:
+			if r.err == nil {
+				s.logger.Printf("ACK publish confirmed by broker %s; SYN received via %s; topic=%s\n", s.brokerName(r.index), s.brokerName(preferredBrokerIndex), topic)
+				return r.index, nil
+			}
+			st := states[r.index]
+			st.pending, st.err = false, r.err
+			st.retryAt = time.Now().Add(mqttPublishTickerInterval)
+		case <-changed:
+		case <-ticker.C:
+		case <-ctx.Done():
 		}
 	}
-	success := publishAtLeastN(ctx, preferredClients, topic, qos, payload, 1, mqttPreferredBrokerWindow)
-	if success > 0 {
-		s.logger.Printf("published topic %s via preferred broker %s\n", topic, s.brokerName(preferredBrokerIndex))
-	} else {
-		s.logger.Printf("preferred broker publish missed for topic %s via %s\n", topic, s.brokerName(preferredBrokerIndex))
-	}
-	return success
 }
 
 func (s *MQTTSignalSession) exchange(ctx context.Context, exmode int, sendData, topicSalt, sessionUid string, timeout time.Duration, messageHandler func(string) (bool, error), preferredBrokerIndex int) (recvData string, recvIndex int, keepAlive bool, err error) {
@@ -543,27 +871,26 @@ func (s *MQTTSignalSession) exchange(ctx context.Context, exmode int, sendData, 
 	if cause := context.Cause(parentCtx); cause != nil {
 		return "", -1, false, cause
 	}
-	stopPublish := make(chan struct{})
-	var stopPublishOnce sync.Once
-	stopPublisher := func() {
-		stopPublishOnce.Do(func() {
-			close(stopPublish)
-		})
-	}
+	// Successful exchanges keep publishing briefly after exchangeCtx ends.
+	// Cancel this separate scope on failure or when the keep-alive window ends.
+	publishCtx, stopPublisher := context.WithCancel(s.ctx)
+	diagnostics := &mqttPublishDiagnostics{}
+	defer func() {
+		if !keepAlive {
+			stopPublisher()
+		}
+	}()
 
 	startBackgroundPublisher := func() {
 		go func() {
 			for _, delay := range mqttPublishBurstDelays {
 				timer := time.NewTimer(delay)
 				select {
-				case <-stopPublish:
-					timer.Stop()
-					return
-				case <-s.ctx.Done():
+				case <-publishCtx.Done():
 					timer.Stop()
 					return
 				case <-timer.C:
-					s.publish(s.ctx, topic, qos, sendData, 1, 0)
+					s.publish(publishCtx, topic, qos, sendData, 1, diagnostics)
 				}
 			}
 
@@ -571,26 +898,23 @@ func (s *MQTTSignalSession) exchange(ctx context.Context, exmode int, sendData, 
 			defer ticker.Stop()
 			for {
 				select {
-				case <-stopPublish:
-					return
-				case <-s.ctx.Done():
+				case <-publishCtx.Done():
 					return
 				case <-ticker.C:
-					s.publish(s.ctx, topic, qos, sendData, 1, 0)
+					s.publish(publishCtx, topic, qos, sendData, 1, diagnostics)
 				}
 			}
 		}()
 	}
 
 	stopPublisherAfter := func(delay time.Duration) {
+		timer := time.NewTimer(delay)
 		go func() {
-			timer := time.NewTimer(delay)
 			defer timer.Stop()
 			select {
 			case <-timer.C:
 				stopPublisher()
-			case <-s.ctx.Done():
-				stopPublisher()
+			case <-publishCtx.Done():
 			}
 		}()
 	}
@@ -607,30 +931,35 @@ func (s *MQTTSignalSession) exchange(ctx context.Context, exmode int, sendData, 
 		removeWaiter = s.addWaiter(topic, waiter)
 		defer removeWaiter()
 	}
+	var initialPublishWait time.Duration
+	defer func() {
+		if err != nil && waiter != nil {
+			err = fmt.Errorf("%w; initial_publish_wait=%s; %s; %s", err, initialPublishWait.Round(time.Millisecond), diagnostics.summary(s), waiter.receiveSummary(s))
+		}
+	}()
 
 	switch exmode {
 	case EXMODE_waitOnly:
 	case exmodePublishOnly:
-		success := s.publishPreferred(exchangeCtx, topic, qos, sendData, preferredBrokerIndex)
-		if success == 0 {
-			success = s.publish(exchangeCtx, topic, qos, sendData, 1, mqttPublishSettleWindow)
-		}
-		if success == 0 {
-			return "", -1, false, fmt.Errorf("failed to publish MQTT reply")
+		index, err := s.publishReply(exchangeCtx, topic, qos, sendData, preferredBrokerIndex)
+		if err != nil {
+			return "", -1, false, err
 		}
 		startBackgroundPublisher()
 		stopPublisherAfter(mqttPublishKeepAlive)
-		return "", preferredBrokerIndex, true, nil
+		return "", index, true, nil
 	default:
-		s.publish(exchangeCtx, topic, qos, sendData, 1, 0)
+		started := time.Now()
+		s.publish(exchangeCtx, topic, qos, sendData, 1, diagnostics)
+		initialPublishWait = time.Since(started)
 		startBackgroundPublisher()
 	}
 
 	select {
 	case r := <-waiter.recvCh:
 		if exmode != EXMODE_waitOnly {
-			s.publish(s.ctx, topic, qos, sendData, 1, 0)
 			stopPublisherAfter(mqttPublishKeepAlive)
+			go s.publish(publishCtx, topic, qos, sendData, 1, diagnostics)
 			keepAlive = true
 		} else {
 			stopPublisher()
@@ -644,7 +973,7 @@ func (s *MQTTSignalSession) exchange(ctx context.Context, exmode int, sendData, 
 		if cause := context.Cause(parentCtx); cause != nil {
 			return "", -1, false, cause
 		}
-		return "", -1, false, fmt.Errorf("timeout waiting for remote data exchange on topic %s (brokers=%d/%d subscribed=%d)", topic, len(s.clientsSnapshot()), len(s.brokers), s.subscribedCount(topic))
+		return "", -1, false, s.signalError("exchange", topic, fmt.Errorf("timeout waiting for remote data exchange (brokers=%d/%d subscribed=%d)", len(s.clientsSnapshot()), len(s.brokers), s.subscribedCount(topic)))
 	case <-s.ctx.Done():
 		stopPublisher()
 		if cause := context.Cause(parentCtx); cause != nil {
