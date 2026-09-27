@@ -537,7 +537,9 @@ func (c *Client) downloadFile(ctx context.Context, httpClient *http.Client, file
 	}
 	cleanedLocalPath := filepath.Clean(proposedLocalPath)
 
-	if !strings.HasPrefix(cleanedLocalPath, c.absLocalDownloadRoot) {
+	relLocalPath, err := filepath.Rel(c.absLocalDownloadRoot, cleanedLocalPath)
+	if err != nil || relLocalPath == ".." ||
+		strings.HasPrefix(relLocalPath, ".."+string(filepath.Separator)) || filepath.IsAbs(relLocalPath) {
 		return fmt.Errorf("SECURITY ALERT: Attempted path traversal detected for server path '%s'. Resolved local path '%s' is outside root '%s'",
 			fileInfo.Path, cleanedLocalPath, c.absLocalDownloadRoot)
 	}

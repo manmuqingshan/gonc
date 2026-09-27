@@ -11,11 +11,49 @@ import (
 	"os"
 	"path/filepath"
 	"reflect"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
 )
+
+func TestDownloadFileRejectsSiblingPrefixPathTraversal(t *testing.T) {
+	var requests atomic.Int64
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		requests.Add(1)
+		_, _ = io.WriteString(w, "malicious content")
+	}))
+	defer server.Close()
+
+	parentDir := t.TempDir()
+	localDir := filepath.Join(parentDir, "a")
+	if err := os.Mkdir(localDir, 0755); err != nil {
+		t.Fatal(err)
+	}
+
+	client, err := newTestClient(server.URL, localDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	err = client.downloadFile(context.Background(), server.Client(), FileInfo{
+		Name: "evil.bin",
+		Path: "../a2/evil.bin",
+		Size: int64(len("malicious content")),
+	})
+	if err == nil || !strings.Contains(err.Error(), "Attempted path traversal") {
+		t.Fatalf("downloadFile() error = %v, want path traversal error", err)
+	}
+	if got := requests.Load(); got != 0 {
+		t.Fatalf("server requests = %d, want 0", got)
+	}
+
+	outsidePath := filepath.Join(parentDir, "a2", "evil.bin")
+	if _, err := os.Stat(outsidePath); !os.IsNotExist(err) {
+		t.Fatalf("outside file status error = %v, want file not to exist", err)
+	}
+}
 
 func TestDownloadFileOldServerManifestUnsupportedRedownloadsFullFile(t *testing.T) {
 	const remoteBody = "0123456789"
