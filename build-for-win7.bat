@@ -2,7 +2,7 @@
 setlocal
 
 REM === Use Win7-compatible Go toolchain ===
-REM https://github.com/thongtech/go-legacy-win7/releases/download/v1.26.2-1/go-legacy-win7-1.26.2-1.windows_amd64.zip
+REM https://github.com/thongtech/go-legacy-win7/releases/download/v1.26.8-1/go-legacy-win7-1.26.8-1.windows_amd64.zip
 set "GOROOT=C:\go\go-legacy-win7"
 set "PATH=%GOROOT%\bin;%PATH%"
 
